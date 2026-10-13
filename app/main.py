@@ -1,12 +1,12 @@
 """
-Employee Attendance & Analytics API Full implementation 
+Employee Attendance & Analytics API
+Full implementation complying with openapi.yaml, DATA_MODEL.md, and PROBLEM_STATEMENT.docx
 """
 import os
 import math
-import re
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime, timedelta, timezone, date as dt_date
-from typing import Optional, List, Dict, Any, Union
+from typing import Optional, List, Dict, Any
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Path, status
@@ -33,16 +33,16 @@ app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0")
 @app.on_event("startup")
 def create_indexes():
     """Create all indexes required for uniqueness, performance and explain plans."""
-    # 1. employees: emp_code unique
+    # employees indexes
     db.employees.create_index([("emp_code", ASCENDING)], unique=True)
-    # 2. employees: department filter & joined_on queries
     db.employees.create_index([("department", ASCENDING), ("joined_on", ASCENDING)])
-    # 3. attendance_logs: natural key unique index
+    db.employees.create_index([("joined_on", ASCENDING)])
+
+    # attendance_logs indexes
     db.attendance_logs.create_index([("emp_code", ASCENDING), ("date", ASCENDING)], unique=True)
-    # 4. attendance_logs: listAttendance query (date DESC, emp_code ASC)
     db.attendance_logs.create_index([("date", DESCENDING), ("emp_code", ASCENDING)])
-    # 5. attendance_logs: punch-out query (emp_code ASC, punch_in DESC)
     db.attendance_logs.create_index([("emp_code", ASCENDING), ("punch_in", DESCENDING)])
+    db.attendance_logs.create_index([("date", ASCENDING), ("late_minutes", ASCENDING)])
 
 
 # --------------------------------------------------------------------------- #
@@ -314,16 +314,15 @@ def punch_out(body: PunchOutRequest):
     punch_ms = body.punched_at if body.punched_at is not None else now_ms
     punch_out_utc = epoch_ms_to_utc_datetime(punch_ms)
 
-    # Find the most recent record whose punch_in <= punched_at
+    # Must find record where punch_in is not null and <= punch_out_utc
     record = db.attendance_logs.find_one(
-        {"emp_code": body.emp_code, "punch_in": {"$lte": punch_out_utc}},
+        {"emp_code": body.emp_code, "punch_in": {"$ne": None, "$lte": punch_out_utc}},
         sort=[("punch_in", DESCENDING)]
     )
 
     if not record:
         raise HTTPException(status_code=404, detail="No punch-in found for employee")
 
-    # Race check & validation
     p_in = record.get("punch_in")
     if p_in.tzinfo is None:
         p_in = p_in.replace(tzinfo=timezone.utc)
@@ -334,12 +333,10 @@ def punch_out(body: PunchOutRequest):
     if record.get("punch_out") is not None:
         raise HTTPException(status_code=409, detail="Record already punched out")
 
-    # Derived calculations
     wh = compute_work_hours(p_in, punch_out_utc)
     ot = compute_overtime_minutes(punch_out_utc, record["date"], emp["shift_start"], emp["shift_end"])
     half_day = wh < 4.50
 
-    # Atomic update to avoid punch-out race conditions
     updated = db.attendance_logs.find_one_and_update(
         {"_id": record["_id"], "punch_out": None},
         {"$set": {
@@ -399,6 +396,15 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeRequest):
     if not record:
         raise HTTPException(status_code=404, detail="Attendance record not found")
 
+    # Normalize existing record datetimes to aware UTC to avoid comparison type errors
+    rec_punch_in = record.get("punch_in")
+    if rec_punch_in is not None and rec_punch_in.tzinfo is None:
+        rec_punch_in = rec_punch_in.replace(tzinfo=timezone.utc)
+
+    rec_punch_out = record.get("punch_out")
+    if rec_punch_out is not None and rec_punch_out.tzinfo is None:
+        rec_punch_out = rec_punch_out.replace(tzinfo=timezone.utc)
+
     new_status = body.status if body.status is not None else record["status"]
     body_dict = body.model_dump(exclude_unset=True)
 
@@ -408,27 +414,20 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeRequest):
         final_punch_in = None
         final_punch_out = None
     else:
-        final_punch_in = epoch_ms_to_utc_datetime(body.punch_in) if "punch_in" in body_dict else record.get("punch_in")
-        final_punch_out = epoch_ms_to_utc_datetime(body.punch_out) if "punch_out" in body_dict else record.get("punch_out")
+        final_punch_in = epoch_ms_to_utc_datetime(body.punch_in) if "punch_in" in body_dict else rec_punch_in
+        final_punch_out = epoch_ms_to_utc_datetime(body.punch_out) if "punch_out" in body_dict else rec_punch_out
 
         if final_punch_in is None:
             raise HTTPException(status_code=422, detail="Presence status requires punch_in")
 
-        if final_punch_in.tzinfo is None:
-            final_punch_in = final_punch_in.replace(tzinfo=timezone.utc)
-
-        # punch_in must stay on the record's attendance date
         computed_date = determine_attendance_date(final_punch_in, emp["shift_start"], emp["shift_end"])
         if computed_date != date:
             raise HTTPException(status_code=422, detail="punch_in does not match record attendance date")
 
         if final_punch_out is not None:
-            if final_punch_out.tzinfo is None:
-                final_punch_out = final_punch_out.replace(tzinfo=timezone.utc)
             if final_punch_out <= final_punch_in or (final_punch_out - final_punch_in) > timedelta(hours=24):
                 raise HTTPException(status_code=422, detail="Invalid punch_out relative to punch_in")
 
-    # Recompute derived fields
     if new_status in ("ABSENT", "LEAVE"):
         final_late_minutes = 0
         final_overtime_minutes = 0
@@ -445,12 +444,11 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeRequest):
             final_overtime_minutes = 0
             final_half_day = False
 
-    # Check for actual changes
     changes = {}
     candidate_changes = [
         ("status", record.get("status"), new_status),
-        ("punch_in", record.get("punch_in"), final_punch_in),
-        ("punch_out", record.get("punch_out"), final_punch_out),
+        ("punch_in", rec_punch_in, final_punch_in),
+        ("punch_out", rec_punch_out, final_punch_out),
         ("work_hours", record.get("work_hours"), final_work_hours),
         ("late_minutes", record.get("late_minutes", 0), final_late_minutes),
         ("overtime_minutes", record.get("overtime_minutes", 0), final_overtime_minutes),
@@ -472,9 +470,14 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeRequest):
         "changes": changes
     }
 
-    # Concurrent safe update
+    match_filter = {"_id": record["_id"]}
+    if "history" in record:
+        match_filter["history"] = record["history"]
+    else:
+        match_filter["history"] = {"$exists": False}
+
     res = db.attendance_logs.find_one_and_update(
-        {"_id": record["_id"], "history": record.get("history", [])},
+        match_filter,
         {
             "$set": {
                 "status": new_status,
@@ -520,12 +523,15 @@ def employee_monthly(
     if start_date <= last_day_of_month:
         curr = start_date
         while curr <= last_day_of_month:
-            if curr.weekday() < 5:  # Monday to Friday
+            if curr.weekday() < 5:
                 working_days += 1
             curr += timedelta(days=1)
 
     pipeline = [
-        {"$match": {"emp_code": emp_code, "date": {"$regex": f"^{month}"}}},
+        {"$match": {
+            "emp_code": emp_code,
+            "date": {"$gte": f"{month}-01", "$lte": f"{month}-31"}
+        }},
         {"$project": {
             "status": 1,
             "late_minutes": {"$ifNull": ["$late_minutes", 0]},
@@ -541,7 +547,7 @@ def employee_monthly(
                         {
                             "$and": [
                                 {"$in": ["$status", ["PRESENT", "WFH", "ON_DUTY"]]},
-                                {"$in": ["$dayOfWeek", [2, 3, 4, 5, 6]]}  # Mon-Fri (MongoDB 1=Sun, 7=Sat)
+                                {"$in": ["$dayOfWeek", [2, 3, 4, 5, 6]]}
                             ]
                         },
                         {"$cond": ["$half_day", 0.5, 1.0]},
@@ -609,7 +615,8 @@ def department_summary(
                     "$expr": {
                         "$and": [
                             {"$eq": ["$emp_code", "$$emp"]},
-                            {"$eq": [{"$substrCP": ["$date", 0, 7]}, month]}
+                            {"$gte": ["$date", f"{month}-01"]},
+                            {"$lte": ["$date", f"{month}-31"]}
                         ]
                     }
                 }}
@@ -694,7 +701,10 @@ def late_leaderboard(
     department: Optional[str] = None
 ):
     pipeline = [
-        {"$match": {"date": {"$regex": f"^{month}"}, "late_minutes": {"$gt": 0}}},
+        {"$match": {
+            "date": {"$gte": f"{month}-01", "$lte": f"{month}-31"},
+            "late_minutes": {"$gt": 0}
+        }},
         {"$group": {
             "_id": "$emp_code",
             "total_late_minutes": {"$sum": "$late_minutes"},
@@ -749,9 +759,11 @@ def department_trend(
     if (d_to - d_from).days > 92:
         raise HTTPException(status_code=422, detail="Date range cannot exceed 92 days")
 
-    # Check if department exists
     if not db.employees.find_one({"department": department}):
         raise HTTPException(status_code=404, detail="Department not found")
+
+    start_dt = datetime.combine(d_from, datetime.min.time(), tzinfo=timezone.utc)
+    end_dt = datetime.combine(d_to + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc)
 
     pipeline = [
         {"$match": {"department": department}},
@@ -785,22 +797,24 @@ def department_trend(
             },
             "late_count": {"$sum": {"$cond": [{"$gt": ["$logs.late_minutes", 0]}, 1, 0]}}
         }},
-        {"$match": {"_id": {"$ne": None}}},
         {"$project": {
             "date": "$_id",
             "present_count": 1,
             "late_count": 1,
-            "d_date": {"$dateFromString": {"dateString": "$_id"}}
+            "d_date": {
+                "$cond": [
+                    {"$ne": ["$_id", None]},
+                    {"$dateFromString": {"dateString": "$_id"}},
+                    start_dt
+                ]
+            }
         }},
         {"$densify": {
             "field": "d_date",
             "range": {
                 "step": 1,
                 "unit": "day",
-                "bounds": [
-                    datetime.combine(d_from, datetime.min.time(), tzinfo=timezone.utc),
-                    datetime.combine(d_to + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc)
-                ]
+                "bounds": [start_dt, end_dt]
             }
         }},
         {"$project": {
@@ -901,17 +915,17 @@ def explain_endpoint(
         if status:
             query["status"] = status
         skip = (page - 1) * page_size
-        plan = db.attendance_logs.find(query).sort([("date", DESCENDING), ("emp_code", ASCENDING)]).skip(skip).limit(page_size).explain()
+        plan = db.attendance_logs.find(query).sort([("date", DESCENDING), ("emp_code", ASCENDING)]).skip(skip).limit(page_size).explain("executionStats")
         return {"endpoint": endpoint, "collection": "attendance_logs", "explain": plan}
 
     elif endpoint == "employee_monthly":
         if not emp_code or not month:
             raise HTTPException(status_code=422, detail="emp_code and month are required")
         pipeline = [
-            {"$match": {"emp_code": emp_code, "date": {"$regex": f"^{month}"}}},
+            {"$match": {"emp_code": emp_code, "date": {"$gte": f"{month}-01", "$lte": f"{month}-31"}}},
             {"$group": {"_id": None, "total_late": {"$sum": "$late_minutes"}}}
         ]
-        plan = db.command("aggregate", "attendance_logs", pipeline=pipeline, explain=True)
+        plan = db.command({"explain": {"aggregate": "attendance_logs", "pipeline": pipeline, "cursor": {}}, "verbosity": "executionStats"})
         return {"endpoint": endpoint, "collection": "attendance_logs", "explain": plan}
 
     elif endpoint == "department_summary":
@@ -921,22 +935,22 @@ def explain_endpoint(
         if department:
             match_stage["department"] = department
         pipeline = [{"$match": match_stage}, {"$group": {"_id": "$department"}}]
-        plan = db.command("aggregate", "employees", pipeline=pipeline, explain=True)
+        plan = db.command({"explain": {"aggregate": "employees", "pipeline": pipeline, "cursor": {}}, "verbosity": "executionStats"})
         return {"endpoint": endpoint, "collection": "employees", "explain": plan}
 
     elif endpoint == "late_leaderboard":
         if not month:
             raise HTTPException(status_code=422, detail="month is required")
         pipeline = [
-            {"$match": {"date": {"$regex": f"^{month}"}, "late_minutes": {"$gt": 0}}},
+            {"$match": {"date": {"$gte": f"{month}-01", "$lte": f"{month}-31"}, "late_minutes": {"$gt": 0}}},
             {"$group": {"_id": "$emp_code", "total_late": {"$sum": "$late_minutes"}}}
         ]
-        plan = db.command("aggregate", "attendance_logs", pipeline=pipeline, explain=True)
+        plan = db.command({"explain": {"aggregate": "attendance_logs", "pipeline": pipeline, "cursor": {}}, "verbosity": "executionStats"})
         return {"endpoint": endpoint, "collection": "attendance_logs", "explain": plan}
 
     elif endpoint == "department_trend":
         if not department or not from_date or not to_date:
             raise HTTPException(status_code=422, detail="department, from, and to are required")
         pipeline = [{"$match": {"department": department}}]
-        plan = db.command("aggregate", "employees", pipeline=pipeline, explain=True)
+        plan = db.command({"explain": {"aggregate": "employees", "pipeline": pipeline, "cursor": {}}, "verbosity": "executionStats"})
         return {"endpoint": endpoint, "collection": "employees", "explain": plan}
